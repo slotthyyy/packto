@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""mypm - minimal installer for your own Python scripts on GitHub.
+
+Usage:
+    mypm.py install user/repo
+    mypm.py remove  <name>
+    mypm.py list
+
+Each repo needs a package.toml in its root, e.g.:
+
+    name = "mytool"
+    entry = "mytool.py"
+    command = "mytool"
+
+    [dependencies]
+    pip = ["requests", "rich>=13"]
+    system = ["ffmpeg", "git"]
+
+Requires Python 3.11+ (for tomllib) and git. Unix-only as written.
+"""
+import argparse
+import shutil
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+ROOT = Path.home() / ".mypm"
+PKG_DIR = ROOT / "packages"
+BIN_DIR = Path.home() / ".local" / "bin"
+
+
+def run(cmd):
+    subprocess.run([str(c) for c in cmd], check=True)
+
+
+def load_manifest(pkg_path):
+    with open(pkg_path / "package.toml", "rb") as f:
+        return tomllib.load(f)
+
+
+def install(spec):
+    PKG_DIR.mkdir(parents=True, exist_ok=True)
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. Clone into a temp dir so a failed install never clobbers a working one
+    tmp = ROOT / "tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    run(["git", "clone", "--depth", "1", f"https://github.com/{spec}.git", tmp])
+
+    # 2. Read the manifest
+    m = load_manifest(tmp)
+    name, entry = m["name"], m["entry"]
+    command = m.get("command", name)
+
+    # 3. Move into place (replacing any previous version)
+    dest = PKG_DIR / name
+    shutil.rmtree(dest, ignore_errors=True)
+    shutil.move(str(tmp), str(dest))
+
+    # 4. Create a private venv and install pip dependencies into it
+    venv = dest / ".venv"
+    run([sys.executable, "-m", "venv", venv])
+    py = venv / "bin" / "python"
+    deps = m.get("dependencies", {})
+    if (dest / "requirements.txt").exists():
+        run([py, "-m", "pip", "install", "-r", dest / "requirements.txt"])
+    if deps.get("pip"):
+        run([py, "-m", "pip", "install", *deps["pip"]])
+
+    # 5. Check (don't install) system dependencies
+    missing = [d for d in deps.get("system", []) if not shutil.which(d)]
+    if missing:
+        print(f"Warning: missing system dependencies: {', '.join(missing)}")
+
+    # 6. Write a launcher that always uses the package's own venv
+    launcher = BIN_DIR / command
+    launcher.write_text(f'#!/bin/sh\nexec "{py}" "{dest / entry}" "$@"\n')
+    launcher.chmod(0o755)
+
+    print(f"Installed {name}. Run it with: {command}")
+    if str(BIN_DIR) not in __import__("os").environ["PATH"].split(":"):
+        print(f"Note: add {BIN_DIR} to your PATH to use it.")
+
+
+def remove(name):
+    dest = PKG_DIR / name
+    if not dest.exists():
+        sys.exit(f"{name} is not installed.")
+    command = load_manifest(dest).get("command", name)
+    (BIN_DIR / command).unlink(missing_ok=True)
+    shutil.rmtree(dest)
+    print(f"Removed {name}.")
+
+
+def list_installed():
+    for pkg in sorted(PKG_DIR.glob("*/package.toml")):
+        m = load_manifest(pkg.parent)
+        print(f"{m['name']} {m.get('version', '?')}  ->  {m.get('command', m['name'])}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="mypm")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("install").add_argument("spec", help="user/repo")
+    sub.add_parser("remove").add_argument("name")
+    sub.add_parser("list")
+    args = p.parse_args()
+
+    if args.cmd == "install":
+        install(args.spec)
+    elif args.cmd == "remove":
+        remove(args.name)
+    else:
+        list_installed()
+
+
+if __name__ == "__main__":
+    main()
